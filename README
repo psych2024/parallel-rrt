@@ -1,0 +1,185 @@
+## Motivation
+
+- There are two ways we can make planning and optimization faster:
+    1. By designing better optimizers
+    2. By making the optimization computations faster
+- To enable the latter, parallelization is very enticing as we can easliy scale our compute resources horizontally to improve performance.
+- RRT is a great planner to attempt parallelization because there are many ways to do so, each with its own tradeoffs. Considering those tradeoffs is something that I found interesting.
+- Overall, I am interested in exploring more on the intersections of optmization and systems programming through this project.
+
+## Library Features
+
+- OOP-based RRT planner
+- Parallelization with multithreading
+- Generalized with C++ generics for easy extension to any use case
+    - The code has minimal assumptions on the state space, and can be used even in cases where the state space is not a vector space
+    - The tree data structure is also generalized away as an interface for users to specify their own optimizations for tree updates and queries
+- Code generally follows standard C++ library conventions with proper namespaces
+- Efficient manipulation of heavy states through applications of move semantics and lvalue references, whenever possible. Potential performance improvements over python implementation for high dimension states, such as a high DOF robotic arm.
+- Clear code semantics using modern C++ features
+- Robust randomization sampling using mt19937 with random_device as seed
+
+## RRT Planners
+
+This project contains two RRT planner implementations.
+
+### VanillaPlanner
+
+- Original RRT for benchmarking and testing generic interfaces.
+- Strong consistency: nearest neighbor is always accurate.
+
+### **ParallelPlanner**
+
+- Uses threads to provide parallelization
+- The idea is to parallelize RRT tree expansion by allowing multiple worker threads to sample and extend the same RRT tree.
+
+**Design Approach**
+
+- We first note that we always add nodes into the RRT tree `→` we never modify or remove nodes.
+- For parallelizing, this means that we only have to consider the following situations for race conditions
+    - Appending a new node into the tree `→` Multiple threads might write to the same index due to stale reads of the tree size.
+    - Identifying the nearest neighbor `→` As a thread computes the nearest neighbor for a node, other threads might be in the process of adding new nodes, and threads cannot determine up to which part of the tree is safe to read.
+- For each of these conditions respectively, we can solve them by:
+    - Using an atomic reference to increment the size of the tree. This prevents threads from stomping over each other since each index will be assigned to only one thread.
+    - Maintaining a synchronized atomic variable which tracks the index of the last added node, such that every entry from 0 to index is completely written. Then, we can identify the nearest neighbor by considering nodes in the range 0, index).
+
+**Additional Considerations**
+
+A particular challenge in this project is supporting resizing of the vector containing the tree nodes. Resizing requires freeing the old allocation, and creating a larger contiguous allocation. If one thread triggers a resize while another thread is iterating through the list, it will cause undefined behavior. Also, multiple threads might trigger resize, which is a problem.
+Proposed solution:
+
+- Using a read write lock. The idea is that we need to make sure no one is reading from the tree vector when we are resizing.
+- Threads that query the tree will acquire a read lock. If a thread wants to write to an index beyond the vector capacity and resize the vector, they have to acquire a write lock to modify it.
+- We will need to control vector resizing, and make sure it does not occur implicitly. To do so, we can preallocate empty entries, and resize when we use up all the empty entries.
+- Note that writing to an entry that is not beyond our capacity does not require acquiring a write lock, as the entry writes are independent.
+- Also, to prevent multiple resizes, always delegate the thread involved in inserting to index=capacity to do the resizing. Everyone else inserting to indices > capacity, waits on a conditional variable. Once the thread responsible for resizing is done resizing, they will wake all threads sleeping on the conditional variable.
+
+## Implementation Tradeoffs
+
+### 1. Abstractions
+
+The main focus behind the library design is to generalize away the state type as much as possible, so that the planner can be applied in various settings. I opted for an abstract base class abstraction for specifying the behavior of the RRT state space. An equally valid option, would be to employ C++ concepts to specify the behavior of the state space.
+
+**Abstract Base Class**
+
+- Easier to understand, lower learning curve
+- Easier to port and integrate into existing applications → A single adapter class is enough and is easier to integrate into legacy code.
+
+**Concept Programming**
+
+- Compile-time interface checking enforces behavior requirements, type constraints etc at compile time → better semantic clarity.
+- Allows for a wider generalization → Does not require inheritance
+- However, it comes at a cost of a steeper learning curve, and is harder to integrate into legacy code.
+
+### 2. Performance vs Correctness
+
+VanillaRRT vs ParallelRRT
+
+- In parallelizing, we sacrifice some correctness for performance.
+
+Depending on the execution of the threads, the invariant that a new sample is connected to the nearest neighbor might be violated. Multiple scenarios where the invariant might be violated. For example,
+
+- thread A determines that node `x` is the nearest neighbor and is about to append a new node to `x`
+- Thread B inserts a new node `y` into the tree which becomes the new nearest neighbor for A
+- Thread A continues with inserting a new node connecting it with node `x`
+- This breaks the invariant because the new node is appended to `x` instead of the nearest neighbor `y`.
+
+However, this is a fair tradeoff as the final path generated by the RRT planner will still remain valid and not using the most accurate nearest neighbor will have minimal impact the rate of convergence. We also incur more programming complexity, as eliminating deadlocks and data races are generally harder
+
+### 3. Tree Implementation
+
+There are two options for implementing trees in code:
+
+1. Array-based, with parent array
+2. Pointer-based
+
+Array-based approach is chosen for this project:
+
+- The main computation work of RRT is tree expansion
+- Laying all the nodes together allows for faster reading due to CPU caching
+- Hence, the array based representation is usually more performant
+
+However, it comes with the tradeoff of increased programming complexity, especially for parallelized RRT, as coordinating thread synchronization while preventing contentions is harder within a single data structure.
+
+On the other hand, the pointer-based approach:
+
+- Allocates the tree on heap → Since we are only adding nodes and never modifying, minimal effort is required to synchronize the reads (assuming we allow stale reads).
+- Is easier to incorporate synchronization, as the tree data structure is more sparse and managing syncrhonization at the node granularity is easier.
+
+### Benchmarking
+
+Benchmarking is done using nanobench, a lightweight C++ benchmark library. Results obtained from `benchmark.cpp` on a M2 Macbook Air by averaging over 100 runs per epoch. They can be executed by running the CMake execution targets `bench_vanilla` and `bench_parallel`. 
+
+*Note: `op` represents a single run of the RRT test. `total`: wall-clock time spent running benchmark.*
+
+**Vanilla Planner (1 Worker)**
+
+| ns/op | op/s | err% | total | benchmark |
+| --- | --- | --- | --- | --- |
+| 44,366,209.95 | 22.54 | 2.6% | 53.12 | `rrt` |
+
+**Parallel Planner (2 Workers)**
+
+| ns/op | op/s | err% | total | benchmark |
+| --- | --- | --- | --- | --- |
+| 25,171,503.23 | 39.73 | 2.5% | 29.88 | `rrt` |
+
+**Parallel Planner (3 Workers)**
+
+| ns/op | op/s | err% | total | benchmark |
+| --- | --- | --- | --- | --- |
+| 20,378,821.43 | 49.07 | 2.8% | 24.56 | `rrt` |
+
+**Parallel Planner (4 Workers)**
+
+| ns/op | op/s | err% | total | benchmark |
+| --- | --- | --- | --- | --- |
+| 16,875,398.96 | 59.26 | 3.3% | 20.26 | `rrt` |
+
+**Parallel Planner (5 Workers)**
+
+| ns/op | op/s | err% | total | benchmark |
+| --- | --- | --- | --- | --- |
+| 16,937,154.35 | 59.04 | 2.9% | 20.19 | `rrt` |
+
+**Parallel Planner (6 Workers)**
+
+| ns/op | op/s | err% | total | benchmark |
+| --- | --- | --- | --- | --- |
+| 16,627,719.92 | 60.14 | 3.9% | 19.91 | `rrt` |
+|  |  |  |  |  |
+
+![image.png
+
+As we scale up the number of workers from 2-4, we get good performance scaling. However, this performance scaling is sublinear as we increase the number of workers. When we get to 5 workers, we do not observe any significant improvements and the completion time remains constant for 5 or more workers. 
+
+Potential reasons:
+
+1. When we get to 5 workers, thread contention overheads cancel out the benefits from parallelization
+2. 16ms is the baseline time required to instantiate everything and run the planner. A more complex benchmark case might be required.
+
+Nonetheless, we have shown that Parallel RRT provides significant performance improvements as compared to vanilla RRT implementations.
+
+### If I had More Time / Future Work
+
+1. Consider improving efficiency of nearest neighbor by using KD-trees instead of a naive linear search for state spaces that behave like euclidean vector spaces. Work on this needs to find a good way to incorporate the KD-tree while maintaining generalizations that this RRT implementation provides.
+2. Include support for other RRT variants such as RRT connect, RRT* and Informed RRT*
+3. Consider using pointer-based tree and parallelizing at the granularity of nodes with the following idea:
+
+```jsx
+Maintain Mutex locks at each node
+
+- Threads can freely read from the tree
+- They only have to acquire the mutex of an existing node when appending a new node to that existing node.
+```
+
+4. Consider another different parallelization algorithm with a coarser synchronization granularity of the entire tree:
+
+```jsx
+Maintaining a global read-write lock on the tree
+
+- Threads will acquire a read lock when attempting to identify the nearest neighbor.
+- They will acquire a write lock before attempting to insert a new node into the tree.
+```
+
+5. Benchmark the different parallelization approaches and analyze their tradeoffs.
