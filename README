@@ -149,7 +149,7 @@ Benchmarking is done using nanobench, a lightweight C++ benchmark library. Resul
 | 16,627,719.92 | 60.14 | 3.9% | 19.91 | `rrt` |
 |  |  |  |  |  |
 
-![image.png
+![Benchmark results](benchmark.png)
 
 As we scale up the number of workers from 2-4, we get good performance scaling. However, this performance scaling is sublinear as we increase the number of workers. When we get to 5 workers, we do not observe any significant improvements and the completion time remains constant for 5 or more workers. 
 
